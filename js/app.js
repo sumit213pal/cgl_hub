@@ -1,6 +1,7 @@
 import db, { isDemo } from "./db.js";
 import { ADMIN_EMAIL, GROUP_NAME, TARGET_DATE } from "./config.js";
 import { SUBJECTS, ALL_TOPICS, TOPIC_MAP, SUBJECT_MAP, TIER_LABEL } from "./syllabus.js";
+import { createTests } from "./tests.js";
 
 // ---------------- helpers ----------------
 const $ = s => document.querySelector(s);
@@ -53,16 +54,15 @@ function genPw() {
   const r = crypto.getRandomValues(new Uint32Array(10));
   return "Cgl@" + [...r].slice(0, 6).map(x => c[x % c.length]).join("");
 }
-function toast(msg) { const t = $("#toast"); t.textContent = msg; t.classList.add("show"); clearTimeout(toast.t); toast.t = setTimeout(() => t.classList.remove("show"), 2600); }
-function screen(name) {
-  ["loading", "login", "pwScreen", "app"].forEach(id => $("#" + id).classList.toggle("hidden", id !== name));
-}
+function toast(msg) { if (!msg) return; const t = $("#toast"); t.textContent = msg; t.classList.add("show"); clearTimeout(toast.t); toast.t = setTimeout(() => t.classList.remove("show"), 2800); }
+function screen(name) { ["loading", "login", "pwScreen", "app"].forEach(id => $("#" + id).classList.toggle("hidden", id !== name)); }
 
 // ---------------- state ----------------
 const S = {
-  me: null, route: "dashboard", subject: "quant", filter: "all", search: "",
+  me: null, route: "dashboard", arg: "", subject: "quant", filter: "all", search: "", adminTab: "members",
   libType: "all", libSubject: "all", libSearch: "", openTopic: null,
-  members: [], progress: {}, resources: [], drives: [], logs: [], mocks: [], comments: [], activity: [], notices: []
+  members: [], progress: {}, resources: [], drives: [], logs: [], mocks: [], comments: [], activity: [], notices: [],
+  qindex: [], tests: [], attempts: [], mistakes: [], bookmarks: [], reports: []
 };
 const unsub = [];
 
@@ -103,6 +103,12 @@ function dueForRevision(uid) {
 const logActivity = text => db.add("activity", { uid: S.me.uid, text }).catch(() => {});
 const setStatus = (tid, v) => db.set("progress", S.me.uid, { topics: { [tid]: v }, at: { [tid]: Date.now() }, updatedAt: Date.now() });
 
+// ---------------- test system (PYQ question bank, timed tests, analytics) ----------------
+const T = createTests({
+  S, db, $, esc, toast, modal: html => modal(html), closeModal: () => closeModal(), avatar, nameOf, logActivity,
+  rerender: () => render(), today, pct, dueCount: () => dueForRevision(S.me.uid).length
+});
+
 // ---------------- auth flow ----------------
 $("#loginTitle").textContent = GROUP_NAME;
 $("#brandName").textContent = GROUP_NAME;
@@ -126,7 +132,7 @@ $("#pwLogout").onclick = () => db.signOut();
 
 db.onAuth(async user => {
   unsub.splice(0).forEach(f => f && f());
-  S.openTopic = null; $("#drawer").classList.add("hidden"); closeModal();
+  S.openTopic = null; $("#drawer").classList.add("hidden"); closeModal(); T.X.closeRunner?.();
   if (!user) { S.me = null; screen("login"); return; }
   try {
     let m = await db.get("members", user.email);
@@ -172,29 +178,43 @@ function startApp() {
   screen("app");
   $("#navAdmin").classList.toggle("hidden", !S.me.isAdmin);
   const bind = (col, fn) => unsub.push(db.watch(col, fn));
+  const mine = (col, fn) => unsub.push(db.watchWhere(col, "uid", S.me.uid, fn));
   bind("members", d => {
     S.members = d;
-    const mine = d.find(m => m.id === S.me.email);
-    if (mine && mine.active === false) { db.signOut(); loginMsg("Your access has been disabled. Contact the admin."); return; }
-    if (mine) S.me.name = mine.name;
+    const me = d.find(m => m.id === S.me.email);
+    if (me && me.active === false) { db.signOut(); loginMsg("Your access has been disabled. Contact the admin."); return; }
+    if (me) S.me.name = me.name;
     refresh();
   });
   bind("progress", d => { S.progress = Object.fromEntries(d.map(x => [x.id, x])); refresh(); });
   ["resources", "drives", "logs", "mocks", "comments", "activity", "notices"].forEach(c =>
     bind(c, d => { S[c] = d.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)); refresh(); }));
+  // test system data
+  bind("qindex", d => { S.qindex = d; refresh(); });
+  bind("tests", d => { S.tests = d.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)); refresh(); });
+  mine("attempts", d => { S.attempts = d.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)); T.onAttempts(); refresh(); });
+  mine("mistakes", d => { S.mistakes = d; refresh(); });
+  mine("bookmarks", d => { S.bookmarks = d; refresh(); });
+  if (S.me.isAdmin) bind("reports", d => { S.reports = d; refresh(); });
   route();
 }
 
 // ---------------- routing & render ----------------
 window.addEventListener("hashchange", route);
 function route() {
-  S.route = (location.hash.slice(1) || "dashboard").split("/")[0];
+  const parts = (location.hash.slice(1) || "dashboard").split("/");
+  S.route = parts[0]; S.arg = parts[1] || "";
   if (S.route === "admin" && !S.me?.isAdmin) S.route = "dashboard";
-  document.querySelectorAll("#nav a").forEach(a => a.classList.toggle("active", a.dataset.route === S.route));
+  document.querySelectorAll("#nav a").forEach(a => a.classList.toggle("active", a.dataset.route === (S.route === "result" ? "tests" : S.route)));
+  window.scrollTo(0, 0);
   render();
 }
 let raf;
-function refresh() { cancelAnimationFrame(raf); raf = requestAnimationFrame(() => { render(); if (S.openTopic) renderDrawerBody(); }); }
+function refresh() {
+  if (T.isRunning()) return; // don't redraw behind a running test
+  cancelAnimationFrame(raf);
+  raf = requestAnimationFrame(() => { render(); if (S.openTopic) renderDrawerBody(); });
+}
 
 function render() {
   if (!S.me || $("#app").classList.contains("hidden")) return;
@@ -206,15 +226,18 @@ function render() {
   // keep typed text + focus across live re-renders
   const main = $("#main"), saved = {}, act = document.activeElement;
   main.querySelectorAll("form[id] [name]").forEach(el => (saved[el.form.id + "|" + el.name] = el.value));
-  const focusKey = act?.form?.id && main.contains(act) ? act.form.id + "|" + act.name : act?.id && main.contains(act) ? "#" + act.id : null;
+  const inMain = act && main.contains(act);
+  const focusKey = inMain && act.dataset?.bind && !["radio", "checkbox"].includes(act.type) ? "bind:" + act.dataset.bind
+    : inMain && act.form?.id ? act.form.id + "|" + act.name : inMain && act.id ? "#" + act.id : null;
 
-  const views = { dashboard: viewDashboard, syllabus: viewSyllabus, library: viewLibrary, tracker: viewTracker, drives: viewDrives, admin: viewAdmin };
+  const views = { dashboard: viewDashboard, syllabus: viewSyllabus, library: viewLibrary, tracker: viewTracker, drives: viewDrives, admin: viewAdmin, ...T.views };
   const y = window.scrollY;
   main.innerHTML = (views[S.route] || viewDashboard)();
   main.querySelectorAll("form[id] [name]").forEach(el => { const k = el.form.id + "|" + el.name; if (k in saved) el.value = saved[k]; });
   if (focusKey) {
-    const el = focusKey.startsWith("#") ? main.querySelector(focusKey) : main.querySelector(`#${focusKey.split("|")[0]} [name="${focusKey.split("|")[1]}"]`);
-    if (el) { el.focus(); if (el.setSelectionRange && el.type !== "email" && el.type !== "number") el.setSelectionRange(el.value.length, el.value.length); }
+    const el = focusKey.startsWith("bind:") ? main.querySelector(`[data-bind="${focusKey.slice(5)}"]`)
+      : focusKey.startsWith("#") ? main.querySelector(focusKey) : main.querySelector(`#${focusKey.split("|")[0]} [name="${focusKey.split("|")[1]}"]`);
+    if (el) { el.focus(); try { el.setSelectionRange(el.value.length, el.value.length); } catch { /* number/email inputs */ } }
   }
   wire();
   window.scrollTo(0, y);
@@ -241,6 +264,8 @@ function viewDashboard() {
   </header>
 
   ${S.notices.slice(0, 3).map(n => `<div class="notice">📢 <span class="grow">${esc(n.text)}</span><small>${esc(nameOf(n.uid))} · ${ago(n.createdAt)}</small></div>`).join("")}
+
+  ${T.coachCard()}
 
   <section class="grid cards">
     ${us.map(u => `
@@ -313,9 +338,10 @@ function viewSyllabus() {
         const res = S.resources.filter(r => r.topicId === t.id);
         const vids = res.filter(r => r.type === "youtube").length, notes = res.length - vids;
         const cm = S.comments.filter(c => c.topicId === t.id).length;
+        const nq = T.X.scope({ topic: t.id }).length;
         return `<div class="topic">
           <button class="tname" data-topic="${t.id}">${esc(t.name)}</button>
-          <div class="counts">${vids ? `<span title="Videos">▶️ ${vids}</span>` : ""}${notes ? `<span title="Notes/links">📄 ${notes}</span>` : ""}${cm ? `<span title="Comments">💬 ${cm}</span>` : ""}</div>
+          <div class="counts">${nq ? `<span title="PYQ questions in bank">❓ ${nq}</span>` : ""}${vids ? `<span title="Videos">▶️ ${vids}</span>` : ""}${notes ? `<span title="Notes/links">📄 ${notes}</span>` : ""}${cm ? `<span title="Comments">💬 ${cm}</span>` : ""}</div>
           <div class="friends">${us.filter(u => u.id !== S.me.uid).map(u => `<i class="dot ${STATUS[statusOf(u.id, t.id)].cls}" style="outline-color:${color(u.id)}" title="${esc(nameOf(u.id))}: ${STATUS[statusOf(u.id, t.id)].label}"></i>`).join("")}</div>
           ${statusSelect(t.id)}
         </div>`;
@@ -380,7 +406,7 @@ function viewTracker() {
   </section>
 
   <div class="grid two">
-    <section class="card"><h2>📈 Mock tests</h2>
+    <section class="card"><h2>📈 Mock tests (manual scores)</h2>
       <div class="grid mini-cards">${us.map(u => {
         const p = S.mocks.filter(x => x.uid === u.id).map(x => (x.score / x.max) * 100);
         return `<div class="mini-card" style="--c:${color(u.id)}">${avatar(u.id, 22)} <b>${esc(nameOf(u.id))}</b>
@@ -421,12 +447,21 @@ function viewDrives() {
 }
 
 function viewAdmin() {
+  const open = S.reports.filter(r => r.status !== "done").length;
+  const tabs = [["members", "👥 Members"], ["qbank", "📚 Question bank"], ["tests", "🧪 Tests"], ["reports", `🚩 Reports${open ? ` (${open})` : ""}`]];
+  const body = S.adminTab === "qbank" ? T.viewQBank() : S.adminTab === "tests" ? T.viewAdminTests() : S.adminTab === "reports" ? T.viewReports() : viewAdminMembers();
+  return `
+  <header class="page-head"><div><h1>🛡️ Admin panel</h1><p class="muted">Manage members, the PYQ question bank, tests and reports.</p></div></header>
+  <div class="tabs">${tabs.map(([k, l]) => `<button class="tab ${S.adminTab === k ? "on" : ""}" data-admintab="${k}">${l}</button>`).join("")}</div>
+  ${body}`;
+}
+
+function viewAdminMembers() {
   const ms = [...S.members].sort((a, b) => (b.role === "admin") - (a.role === "admin") || (a.name || "").localeCompare(b.name || ""));
   const badge = m => m.active === false ? `<span class="badge off">Disabled</span>`
     : m.mustChangePassword ? `<span class="badge warn">Waiting for first login</span>` : `<span class="badge ok">Active</span>`;
   return `
-  <header class="page-head"><div><h1>🛡️ Admin panel</h1>
-    <p class="muted">Add members, control access, post notices. Passwords are never visible – Firebase stores them encrypted.</p></div></header>
+  <p class="muted">Passwords are never visible – Firebase stores them encrypted.</p>
   <div class="grid two">
     <section class="card"><h2>➕ Add member</h2>
       <form id="addMember" class="form">
@@ -466,9 +501,11 @@ function viewAdmin() {
 function openTopic(tid) {
   S.openTopic = tid;
   const t = TOPIC_MAP[tid];
+  const nq = T.X.scope({ topic: tid }).length;
   $("#drawerPanel").innerHTML = `
     <div class="drawer-head"><div><small class="muted">${SUBJECT_MAP[t.subject].icon} ${esc(SUBJECT_MAP[t.subject].name)}</small><h2>${esc(t.name)}</h2></div>
       <button class="x big" data-close="drawer">✕</button></div>
+    ${nq ? `<div class="notice">❓ <span class="grow">${nq} PYQ question${nq > 1 ? "s" : ""} in the bank for this topic.</span><button class="btn sm primary" data-practice="${tid}">Practise 10 Qs</button></div>` : ""}
     <div id="drawerBody"></div>
     <form id="resForm" class="card form">
       <b>Add a resource</b>
@@ -484,6 +521,7 @@ function openTopic(tid) {
     </form>`;
   $("#drawer").classList.remove("hidden");
   renderDrawerBody();
+  $("#drawerPanel").querySelector("[data-practice]")?.addEventListener("click", () => { $("#drawer").classList.add("hidden"); S.openTopic = null; T.X.startTopic(tid); });
   $("#resForm").onsubmit = async e => {
     e.preventDefault();
     const f = Object.fromEntries(new FormData(e.target));
@@ -565,7 +603,7 @@ const ACTIONS = {
   },
   addMock() {
     modal(`<h2>Add mock test score</h2><form id="f" class="form">
-      <label>Mock name / source<input name="name" class="input" required maxlength="80" placeholder="e.g. Full mock 12"></label>
+      <label>Mock name / source<input name="name" class="input" required maxlength="80" placeholder="e.g. Full mock 12 (external)"></label>
       <label>Type<select name="tier" class="input"><option value="T1">Tier 1 (max 200)</option><option value="T2">Tier 2 Paper 1 (max 450)</option><option value="P2">Paper 2 Statistics (max 200)</option></select></label>
       <div class="row"><label class="grow">Score<input type="number" step="0.25" name="score" class="input" required></label>
       <label class="grow">Max<input type="number" name="max" class="input" value="200" required></label></div>
@@ -635,6 +673,7 @@ async function addMember(form) {
 // ---------------- event wiring ----------------
 function wire(root = $("#main")) {
   root.querySelectorAll("[data-subject]").forEach(b => b.onclick = e => { S.subject = b.dataset.subject; if (S.route !== "syllabus") { e.preventDefault(); location.hash = "syllabus"; } else render(); });
+  root.querySelectorAll("[data-admintab]").forEach(b => b.onclick = e => { S.adminTab = b.dataset.admintab; if (S.route !== "admin") { e.preventDefault(); location.hash = "admin"; } else render(); });
   root.querySelectorAll("[data-topic]").forEach(b => b.onclick = () => openTopic(b.dataset.topic));
   root.querySelectorAll("[data-status]").forEach(sel => sel.onchange = async () => {
     const tid = sel.dataset.status, v = sel.value;
@@ -677,6 +716,7 @@ function wire(root = $("#main")) {
   };
   bindInput("search", "search", true); bindInput("filter", "filter");
   bindInput("libSearch", "libSearch", true); bindInput("libType", "libType"); bindInput("libSubject", "libSubject");
+  T.wire(root);
 }
 
 document.addEventListener("click", e => {
@@ -685,7 +725,7 @@ document.addEventListener("click", e => {
   if (c.dataset.close === "drawer") { $("#drawer").classList.add("hidden"); S.openTopic = null; }
 });
 document.addEventListener("keydown", e => {
-  if (e.key !== "Escape") return;
+  if (e.key !== "Escape" || T.isRunning()) return;
   if (!$("#modal").classList.contains("hidden")) closeModal();
   else { $("#drawer").classList.add("hidden"); S.openTopic = null; }
 });

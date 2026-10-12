@@ -1,5 +1,5 @@
 // SSC CGL syllabus (Tier 1 + Tier 2). Edit freely – add/remove topics anytime.
-// tiers: "T1" = Tier 1, "T2" = Tier 2 Paper 1, "P2" = Tier 2 Paper 2 (Statistics, JSO only)
+// NOTE: question CSV files must use these exact topic names (the importer also fuzzy-matches close names).
 export const SUBJECTS = [
   {
     id: "quant", name: "Quantitative Aptitude", icon: "🧮", tiers: ["T1", "T2"],
@@ -68,8 +68,6 @@ export const SUBJECTS = [
 ];
 
 const slug = s => s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
-
-// Stable ids like "quant__percentage"
 SUBJECTS.forEach(sub => {
   sub.topics = sub.topics.map(name => ({ id: `${sub.id}__${slug(name)}`, name, subject: sub.id }));
 });

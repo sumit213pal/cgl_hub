@@ -3,6 +3,7 @@
 // They are never written to Firestore, so nobody – not even the admin – can read them.
 import { firebaseConfig } from "./config.js";
 import { ALL_TOPICS } from "./syllabus.js";
+import { parseCSV, validateRows, importQuestions } from "./csv.js";
 
 export const isDemo = !firebaseConfig.apiKey || firebaseConfig.apiKey.startsWith("PASTE");
 
@@ -21,6 +22,7 @@ if (!isDemo) {
   // Second app instance lets the admin create accounts WITHOUT being logged out.
   const helper = appMod.initializeApp(firebaseConfig, "admin-helper");
   const helperAuth = authMod.getAuth(helper);
+  const docs = snap => snap.docs.map(d => ({ id: d.id, ...d.data() }));
 
   api = {
     onAuth(cb) {
@@ -38,27 +40,50 @@ if (!isDemo) {
       try {
         const c = await authMod.createUserWithEmailAndPassword(helperAuth, email, pw);
         return c.user.uid;
-      } finally {
-        await authMod.signOut(helperAuth).catch(() => {});
-      }
+      } finally { await authMod.signOut(helperAuth).catch(() => {}); }
     },
     async get(col, id) {
       const s = await fs.getDoc(fs.doc(db, col, id));
       return s.exists() ? { id: s.id, ...s.data() } : null;
     },
-    watch(col, cb) {
-      return fs.onSnapshot(fs.collection(db, col),
-        snap => cb(snap.docs.map(d => ({ id: d.id, ...d.data() }))),
-        err => console.warn(col, err.code));
+    // many single-document reads (works with "get"-only security rules, e.g. answerKeys)
+    async getMany(col, ids) {
+      const r = await Promise.all(ids.map(id => fs.getDoc(fs.doc(db, col, id)).catch(e => { console.warn(col, id, e.code); return null; })));
+      return r.filter(s => s && s.exists()).map(s => ({ id: s.id, ...s.data() }));
     },
-    add: (col, data) => fs.addDoc(fs.collection(db, col), { ...data, createdAt: Date.now() }),
+    watch(col, cb) {
+      return fs.onSnapshot(fs.collection(db, col), snap => cb(docs(snap)), err => console.warn(col, err.code));
+    },
+    watchWhere(col, field, val, cb) {
+      return fs.onSnapshot(fs.query(fs.collection(db, col), fs.where(field, "==", val)), snap => cb(docs(snap)), err => console.warn(col, err.code));
+    },
+    async query(col, wheres = [], lim = 50) {
+      const cs = [...wheres.map(([f, v]) => fs.where(f, "==", v)), fs.limit(lim)];
+      return docs(await fs.getDocs(fs.query(fs.collection(db, col), ...cs)));
+    },
+    async add(col, data) { const r = await fs.addDoc(fs.collection(db, col), { ...data, createdAt: Date.now() }); return r.id; },
     set: (col, id, data) => fs.setDoc(fs.doc(db, col, id), data, { merge: true }),
-    remove: (col, id) => fs.deleteDoc(fs.doc(db, col, id))
+    update: (col, id, data) => fs.updateDoc(fs.doc(db, col, id), data),   // replaces whole top-level fields
+    remove: (col, id) => fs.deleteDoc(fs.doc(db, col, id)),
+    async batchSet(items) {                                              // items: [{col,id,data}] (replace)
+      for (let i = 0; i < items.length; i += 400) {
+        const b = fs.writeBatch(db);
+        items.slice(i, i + 400).forEach(it => b.set(fs.doc(db, it.col, it.id), it.data));
+        await b.commit();
+      }
+    },
+    async batchDelete(items) {
+      for (let i = 0; i < items.length; i += 400) {
+        const b = fs.writeBatch(db);
+        items.slice(i, i + 400).forEach(it => b.delete(fs.doc(db, it.col, it.id)));
+        await b.commit();
+      }
+    }
   };
 } else {
   // ---------------- DEMO MODE (no setup needed) ----------------
   // Demo keeps fake passwords in localStorage only to simulate login. Real mode never does this.
-  const KEY = "cgl-hub-demo-v2", PWKEY = "cgl-hub-demo-v2-auth", SESSION = "cgl-hub-demo-session";
+  const KEY = "cgl-hub-demo-v3", PWKEY = "cgl-hub-demo-v3-auth", SESSION = "cgl-hub-demo-v3-session";
   const listeners = {};
   const fail = code => { const e = new Error(code); e.code = code; throw e; };
   const load = () => JSON.parse(localStorage.getItem(KEY) || "null");
@@ -67,17 +92,19 @@ if (!isDemo) {
   const pwSave = p => localStorage.setItem(PWKEY, JSON.stringify(p));
   const store = () => load() || seed();
   const list = col => Object.entries(store()[col] || {}).map(([id, v]) => ({ id, ...v }));
-  const emit = col => (listeners[col] || []).forEach(cb => cb(list(col)));
+  const emit = col => (listeners[col] || []).forEach(l => l.cb(l.f ? list(col).filter(d => d[l.f[0]] === l.f[1]) : list(col)));
+  const clone = o => JSON.parse(JSON.stringify(o));
   const merge = (a, b) => {
     const out = { ...(a || {}) };
     for (const k in b) out[k] = b[k] && typeof b[k] === "object" && !Array.isArray(b[k]) ? merge(out[k], b[k]) : b[k];
     return out;
   };
-  const rid = () => Math.random().toString(36).slice(2, 10);
+  const rid = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-3);
 
   function seed() {
     const now = Date.now(), day = 86400000;
-    const s = { members: {}, progress: {}, resources: {}, drives: {}, logs: {}, mocks: {}, comments: {}, activity: {}, notices: {} };
+    const s = { members: {}, progress: {}, resources: {}, drives: {}, logs: {}, mocks: {}, comments: {}, activity: {}, notices: {},
+      questions: {}, answerKeys: {}, qindex: {}, tests: {}, attempts: {}, mistakes: {}, bookmarks: {}, reports: {} };
     const people = [["demo", "demo@demo", "Sumit (Admin)", "admin"], ["f1", "rahul@demo", "Rahul", "member"], ["f2", "priya@demo", "Priya", "member"]];
     const statuses = ["learning", "done", "done", "revised"];
     const pw = {};
@@ -119,22 +146,43 @@ if (!isDemo) {
       if (newPw.length < 6) fail("auth/weak-password");
       p[user.email].pw = newPw; pwSave(p);
     },
-    async resetPassword() { /* demo: pretend email was sent */ },
+    async resetPassword() {},
     async createUser(email, pw) {
       const p = pwStore();
       if (p[email]) fail("auth/email-already-in-use");
       const uid = rid(); p[email] = { uid, pw }; pwSave(p); return uid;
     },
-    async get(col, id) { const v = (store()[col] || {})[id]; return v ? { id, ...v } : null; },
+    async get(col, id) { const v = (store()[col] || {})[id]; return v ? { id, ...clone(v) } : null; },
+    async getMany(col, ids) { const c = store()[col] || {}; return ids.filter(id => c[id]).map(id => ({ id, ...clone(c[id]) })); },
     watch(col, cb) {
-      (listeners[col] ||= []).push(cb);
+      const l = { cb, f: null }; (listeners[col] ||= []).push(l);
       setTimeout(() => cb(list(col)), 0);
-      return () => (listeners[col] = listeners[col].filter(x => x !== cb));
+      return () => (listeners[col] = listeners[col].filter(x => x !== l));
     },
-    async add(col, data) { const s = store(); (s[col] ||= {})[rid()] = { ...data, createdAt: Date.now() }; save(s); emit(col); },
-    async set(col, id, data) { const s = store(); (s[col] ||= {})[id] = merge(s[col][id], data); save(s); emit(col); },
-    async remove(col, id) { const s = store(); delete (s[col] || {})[id]; save(s); emit(col); }
+    watchWhere(col, field, val, cb) {
+      const l = { cb, f: [field, val] }; (listeners[col] ||= []).push(l);
+      setTimeout(() => cb(list(col).filter(d => d[field] === val)), 0);
+      return () => (listeners[col] = listeners[col].filter(x => x !== l));
+    },
+    async query(col, wheres = [], lim = 50) {
+      return list(col).filter(d => wheres.every(([f, v]) => d[f] === v)).slice(0, lim);
+    },
+    async add(col, data) { const id = rid(); const s = store(); (s[col] ||= {})[id] = { ...clone(data), createdAt: Date.now() }; save(s); emit(col); return id; },
+    async set(col, id, data) { const s = store(); (s[col] ||= {})[id] = merge(s[col][id], clone(data)); save(s); emit(col); },
+    async update(col, id, data) { const s = store(); if (!(s[col] || {})[id]) fail("not-found"); Object.assign(s[col][id], clone(data)); save(s); emit(col); },
+    async remove(col, id) { const s = store(); delete (s[col] || {})[id]; save(s); emit(col); },
+    async batchSet(items) { const s = store(); const cols = new Set(); items.forEach(it => { (s[it.col] ||= {})[it.id] = clone(it.data); cols.add(it.col); }); save(s); cols.forEach(emit); },
+    async batchDelete(items) { const s = store(); const cols = new Set(); items.forEach(it => { delete (s[it.col] || {})[it.id]; cols.add(it.col); }); save(s); cols.forEach(emit); }
   };
+
+  // Load the sample question bank once so the demo has data to practise with.
+  try {
+    if (!Object.keys(store().questions || {}).length) {
+      const text = await (await fetch("sample/cgl_questions_sample.csv")).text();
+      const { valid } = validateRows(parseCSV(text));
+      await importQuestions(api, valid);
+    }
+  } catch (e) { console.warn("demo question seed failed", e); }
 }
 
 export default api;
