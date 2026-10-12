@@ -1,0 +1,56 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ⚠️ Put YOUR admin email here (lowercase) – same as ADMIN_EMAIL in js/config.js
+    function adminEmail() { return 'your.email@gmail.com'; }
+
+    function myEmail()  { return request.auth.token.email.lower(); }
+    function isAdmin()  { return request.auth != null && myEmail() == adminEmail(); }
+    function memberDoc() { return /databases/$(database)/documents/members/$(myEmail()); }
+    // Only people the admin added (and not disabled) can use the site
+    function isMember() {
+      return request.auth != null && (isAdmin() ||
+        (exists(memberDoc()) && get(memberDoc()).data.active == true));
+    }
+
+    // Master user list (doc id = email). Only admin adds/disables people.
+    // A member may only update their own lastSeen / password-changed flags.
+    match /members/{email} {
+      allow read: if isMember() || (request.auth != null && myEmail() == email);
+      allow create, delete: if isAdmin();
+      allow update: if isAdmin() || (
+        isMember() && myEmail() == email
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['lastSeen', 'uid', 'mustChangePassword', 'pwChangedAt'])
+        && request.resource.data.uid == request.auth.uid
+        // a member can only switch mustChangePassword OFF (never back on)
+        && (!('mustChangePassword' in request.resource.data.diff(resource.data).affectedKeys())
+            || request.resource.data.mustChangePassword == false)
+      );
+    }
+
+    // Syllabus progress: everyone reads, only owner writes
+    match /progress/{uid} {
+      allow read: if isMember();
+      allow write: if isMember() && request.auth.uid == uid;
+    }
+
+    // Notice board: admin only writes
+    match /notices/{id} {
+      allow read: if isMember();
+      allow write: if isAdmin();
+    }
+
+    // Shared collections: members read/add; creator edits/deletes; admin can moderate (delete)
+    match /{col}/{id} {
+      allow read: if isMember() && col in ['resources', 'drives', 'logs', 'mocks', 'comments', 'activity'];
+      allow create: if isMember()
+        && col in ['resources', 'drives', 'logs', 'mocks', 'comments', 'activity']
+        && request.resource.data.uid == request.auth.uid;
+      allow update, delete: if isMember()
+        && col in ['resources', 'drives', 'logs', 'mocks', 'comments', 'activity']
+        && (resource.data.uid == request.auth.uid || isAdmin());
+    }
+  }
+}

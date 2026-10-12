@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CGL Study Hub</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📚</text></svg>" />
+  <link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+  <div id="loading" class="login"><div class="login-card"><div class="logo">📚</div><p>Loading…</p></div></div>
+
+  <!-- Login (members only) -->
+  <section id="login" class="login hidden">
+    <div class="login-card">
+      <div class="logo">📚</div>
+      <h1 id="loginTitle">CGL Study Hub</h1>
+      <p>Members only. Ask the admin for access.</p>
+      <form id="loginForm" class="form">
+        <input id="loginEmail" name="email" type="email" class="input" placeholder="Email" required autocomplete="username" />
+        <input id="loginPw" name="pw" type="password" class="input" placeholder="Password" required autocomplete="current-password" />
+        <button class="btn primary big" id="btnLogin">Log in</button>
+      </form>
+      <button class="link small mt-s" id="forgot" type="button">Forgot password?</button>
+      <p id="loginMsg" class="small msg"></p>
+      <p id="demoHint" class="small muted hidden">Demo admin: <b>demo@demo</b> / <b>demo123</b></p>
+    </div>
+  </section>
+
+  <!-- Forced password change on first login -->
+  <section id="pwScreen" class="login hidden">
+    <div class="login-card">
+      <div class="logo">🔑</div>
+      <h1>Set your password</h1>
+      <p>Welcome <b id="pwName"></b>! Replace the temporary password the admin gave you.</p>
+      <form id="pwForm" class="form">
+        <input name="cur" type="password" class="input" placeholder="Temporary password" required autocomplete="current-password" />
+        <input name="p1" type="password" class="input" placeholder="New password (min 8 characters)" required minlength="8" autocomplete="new-password" />
+        <input name="p2" type="password" class="input" placeholder="Confirm new password" required minlength="8" autocomplete="new-password" />
+        <button class="btn primary big">Save &amp; continue</button>
+      </form>
+      <p id="pwMsg" class="small msg"></p>
+      <button class="link small" id="pwLogout" type="button">Log out</button>
+    </div>
+  </section>
+
+  <!-- App -->
+  <div id="app" class="app hidden">
+    <aside class="sidebar">
+      <div class="brand"><span>📚</span> <b id="brandName">CGL Hub</b></div>
+      <nav id="nav">
+        <a href="#dashboard" data-route="dashboard">🏠 <span>Dashboard</span></a>
+        <a href="#syllabus" data-route="syllabus">✅ <span>Syllabus</span></a>
+        <a href="#library" data-route="library">🎬 <span>Library</span></a>
+        <a href="#tracker" data-route="tracker">⏱️ <span>Study &amp; Mocks</span></a>
+        <a href="#drives" data-route="drives">🗂️ <span>Drives</span></a>
+        <a href="#admin" data-route="admin" id="navAdmin" class="hidden">🛡️ <span>Admin</span></a>
+      </nav>
+      <div class="me" id="me"></div>
+    </aside>
+    <main id="main"></main>
+  </div>
+
+  <div id="demoBanner" class="demo-banner hidden">DEMO MODE – data is saved only in this browser. Add your Firebase config in <code>js/config.js</code> to go live.</div>
+
+  <div id="drawer" class="drawer hidden"><div class="drawer-bg" data-close="drawer"></div><div class="drawer-panel" id="drawerPanel"></div></div>
+  <div id="modal" class="modal hidden"><div class="modal-bg" data-close="modal"></div><div class="modal-box" id="modalBox"></div></div>
+  <div id="toast" class="toast"></div>
+
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>
