@@ -62,13 +62,12 @@ const S = {
   me: null, route: "dashboard", arg: "", subject: "quant", filter: "all", search: "", adminTab: "members",
   libType: "all", libSubject: "all", libSearch: "", openTopic: null,
   members: [], progress: {}, resources: [], drives: [], logs: [], mocks: [], comments: [], activity: [], notices: [],
-  qindex: [], tests: [], attempts: [], mistakes: [], bookmarks: [], reports: []
+  qindex: [], tests: [], papers: [], attempts: [], mistakes: [], bookmarks: [], reports: [], flags: [], scores: [], vault: [], cavault: [], votes: [], targets: [], qnotes: []
 };
 const unsub = [];
 
 const allUsers = () => S.members.filter(m => m.uid).map(m => ({ id: m.uid, name: m.name || m.id, email: m.id, lastSeen: m.lastSeen, active: m.active !== false, role: m.role }));
-const users = () => allUsers().filter(u => u.active)
-  .sort((a, b) => (b.role === "admin") - (a.role === "admin") || a.name.localeCompare(b.name));
+const users = () => allUsers().filter(u => u.active).sort((a, b) => (b.role === "admin") - (a.role === "admin") || a.name.localeCompare(b.name));
 const color = uid => COLORS[Math.max(0, users().findIndex(u => u.id === uid)) % COLORS.length];
 const nameOf = uid => (allUsers().find(u => u.id === uid)?.name || "Someone").split(" ")[0];
 const avatar = (uid, size = 28) => {
@@ -90,7 +89,7 @@ function streak(uid) {
 }
 function weekHours(uid) {
   const from = new Date(Date.now() - 6 * DAY).toISOString().slice(0, 10);
-  return S.logs.filter(l => l.uid === uid && l.date >= from).reduce((a, l) => a + Number(l.hours || 0), 0);
+  return Math.round(S.logs.filter(l => l.uid === uid && l.date >= from).reduce((a, l) => a + Number(l.hours || 0), 0) * 10) / 10;
 }
 function dueForRevision(uid) {
   return ALL_TOPICS.map(t => {
@@ -102,12 +101,19 @@ function dueForRevision(uid) {
 }
 const logActivity = text => db.add("activity", { uid: S.me.uid, text }).catch(() => {});
 const setStatus = (tid, v) => db.set("progress", S.me.uid, { topics: { [tid]: v }, at: { [tid]: Date.now() }, updatedAt: Date.now() });
+function statusSelect(tid) {
+  const cur = statusOf(S.me.uid, tid);
+  return `<select class="status ${STATUS[cur].cls}" data-status="${tid}">
+    ${Object.entries(STATUS).map(([k, v]) => `<option value="${k}" ${cur === k ? "selected" : ""}>${v.label}</option>`).join("")}</select>`;
+}
 
-// ---------------- test system (PYQ question bank, timed tests, analytics) ----------------
+// ---------------- test system (PYQ papers, timed tests, analytics, vaults, group features) ----------------
 const T = createTests({
   S, db, $, esc, toast, modal: html => modal(html), closeModal: () => closeModal(), avatar, nameOf, logActivity,
-  rerender: () => render(), today, pct, dueCount: () => dueForRevision(S.me.uid).length
+  rerender: () => render(), today, pct, dueCount: () => dueForRevision(S.me.uid).length,
+  users, color, statusOf, statusSelect, STATUS, openTopicDrawer: id => openTopic(id)
 });
+T.X.act.heatUser = uid => { T.X.st.heatUser = uid; render(); };
 
 // ---------------- auth flow ----------------
 $("#loginTitle").textContent = GROUP_NAME;
@@ -150,9 +156,7 @@ db.onAuth(async user => {
     await db.set("members", user.email, { uid: user.uid, lastSeen: Date.now() });
     if (m.mustChangePassword) return showPwScreen();
     startApp();
-  } catch (err) {
-    console.error(err); await db.signOut(); loginMsg(errMsg(err));
-  }
+  } catch (err) { console.error(err); await db.signOut(); loginMsg(errMsg(err)); }
 });
 
 function showPwScreen() {
@@ -179,6 +183,7 @@ function startApp() {
   $("#navAdmin").classList.toggle("hidden", !S.me.isAdmin);
   const bind = (col, fn) => unsub.push(db.watch(col, fn));
   const mine = (col, fn) => unsub.push(db.watchWhere(col, "uid", S.me.uid, fn));
+  const sorted = (col, d) => { S[col] = d.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)); refresh(); };
   bind("members", d => {
     S.members = d;
     const me = d.find(m => m.id === S.me.email);
@@ -187,14 +192,12 @@ function startApp() {
     refresh();
   });
   bind("progress", d => { S.progress = Object.fromEntries(d.map(x => [x.id, x])); refresh(); });
-  ["resources", "drives", "logs", "mocks", "comments", "activity", "notices"].forEach(c =>
-    bind(c, d => { S[c] = d.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)); refresh(); }));
-  // test system data
-  bind("qindex", d => { S.qindex = d; refresh(); });
-  bind("tests", d => { S.tests = d.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)); refresh(); });
+  ["resources", "drives", "logs", "mocks", "comments", "activity", "notices", "vault", "cavault", "tests", "papers", "targets"].forEach(c => bind(c, d => sorted(c, d)));
+  ["flags", "scores", "votes", "qindex"].forEach(c => bind(c, d => { S[c] = d; refresh(); }));
   mine("attempts", d => { S.attempts = d.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)); T.onAttempts(); refresh(); });
   mine("mistakes", d => { S.mistakes = d; refresh(); });
   mine("bookmarks", d => { S.bookmarks = d; refresh(); });
+  mine("qnotes", d => { S.qnotes = d; refresh(); });
   if (S.me.isAdmin) bind("reports", d => { S.reports = d; refresh(); });
   route();
 }
@@ -229,6 +232,7 @@ function render() {
   const inMain = act && main.contains(act);
   const focusKey = inMain && act.dataset?.bind && !["radio", "checkbox"].includes(act.type) ? "bind:" + act.dataset.bind
     : inMain && act.form?.id ? act.form.id + "|" + act.name : inMain && act.id ? "#" + act.id : null;
+  const caret = inMain && act.selectionStart !== undefined ? act.selectionStart : null;
 
   const views = { dashboard: viewDashboard, syllabus: viewSyllabus, library: viewLibrary, tracker: viewTracker, drives: viewDrives, admin: viewAdmin, ...T.views };
   const y = window.scrollY;
@@ -237,7 +241,7 @@ function render() {
   if (focusKey) {
     const el = focusKey.startsWith("bind:") ? main.querySelector(`[data-bind="${focusKey.slice(5)}"]`)
       : focusKey.startsWith("#") ? main.querySelector(focusKey) : main.querySelector(`#${focusKey.split("|")[0]} [name="${focusKey.split("|")[1]}"]`);
-    if (el) { el.focus(); try { el.setSelectionRange(el.value.length, el.value.length); } catch { /* number/email inputs */ } }
+    if (el) { el.focus(); try { const p = caret ?? el.value.length; el.setSelectionRange(p, p); } catch { /* number/email/date inputs */ } }
   }
   wire();
   window.scrollTo(0, y);
@@ -247,12 +251,8 @@ function render() {
 function viewDashboard() {
   const days = Math.ceil((new Date(TARGET_DATE) - new Date(today())) / DAY);
   const us = users();
-  const myLeft = ALL_TOPICS.filter(t => !["done", "revised"].includes(statusOf(S.me.uid, t.id)));
-  const askFriend = myLeft.map(t => ({ t, by: us.filter(u => u.id !== S.me.uid && ["done", "revised"].includes(statusOf(u.id, t.id))) }))
-    .filter(x => x.by.length).slice(0, 8);
   const gaps = ALL_TOPICS.filter(t => us.every(u => statusOf(u.id, t.id) === "none")).slice(0, 10);
   const due = dueForRevision(S.me.uid);
-
   return `
   <header class="page-head">
     <div><h1>Hi ${esc(S.me.name.split(" ")[0])} 👋</h1><p class="muted">Let's finish today's target together.</p></div>
@@ -266,6 +266,7 @@ function viewDashboard() {
   ${S.notices.slice(0, 3).map(n => `<div class="notice">📢 <span class="grow">${esc(n.text)}</span><small>${esc(nameOf(n.uid))} · ${ago(n.createdAt)}</small></div>`).join("")}
 
   ${T.coachCard()}
+  ${T.targetsCard()}
 
   <section class="grid cards">
     ${us.map(u => `
@@ -287,32 +288,27 @@ function viewDashboard() {
   </section>
 
   <div class="grid two">
-    <section class="card">
-      <h2>🔁 Due for revision <small class="muted">(${due.length})</small></h2>
-      <p class="muted small">Completed 7+ days ago, or revised 30+ days ago. Revise before you forget.</p>
-      ${due.slice(0, 8).map(x => `<div class="li"><span class="grow link-like" data-topic="${x.t.id}">${esc(x.t.name)}</span>
-        <small class="muted">${x.s === "done" ? "done" : "revised"} ${x.days}d ago</small>
-        <button class="btn sm" data-revise="${x.t.id}">✓ Revised</button></div>`).join("") || `<p class="empty">Nothing due. 👍</p>`}
-
-      <h2 class="mt">🤝 Ask a friend</h2>
-      <p class="muted small">Topics you haven't finished but a friend has – ask them to explain.</p>
-      ${askFriend.map(x => `<div class="li" data-topic="${x.t.id}"><span class="grow">${esc(x.t.name)}</span>${x.by.map(u => avatar(u.id, 22)).join("")}</div>`).join("") || `<p class="empty">Nothing yet.</p>`}
-
-      <h2 class="mt">🚧 Group gaps</h2>
-      <p class="muted small">Nobody has started these yet.</p>
-      ${gaps.map(t => `<div class="li" data-topic="${t.id}"><span class="grow">${esc(t.name)}</span><small class="muted">${SUBJECT_MAP[t.subject].icon}</small></div>`).join("") || `<p class="empty">No gaps – great!</p>`}
-    </section>
-    <section class="card">
-      <h2>📰 Recent activity</h2>
-      ${S.activity.slice(0, 20).map(a => `<div class="li">${avatar(a.uid, 22)}<span class="grow"><b>${esc(nameOf(a.uid))}</b> ${esc(a.text)}</span><small class="muted">${ago(a.createdAt)}</small></div>`).join("") || `<p class="empty">No activity yet.</p>`}
-    </section>
+    <div>
+      <section class="card">
+        <h2>🔁 Due for revision <small class="muted">(${due.length})</small></h2>
+        <p class="muted small">Completed 7+ days ago, or revised 30+ days ago. Revise before you forget.</p>
+        ${due.slice(0, 8).map(x => `<div class="li"><span class="grow link-like" data-topic="${x.t.id}">${esc(x.t.name)}</span>
+          <small class="muted">${x.s === "done" ? "done" : "revised"} ${x.days}d ago</small>
+          <button class="btn sm" data-revise="${x.t.id}">✓ Revised</button></div>`).join("") || `<p class="empty">Nothing due. 👍</p>`}
+        <h2 class="mt">🚧 Group gaps</h2>
+        <p class="muted small">Nobody has started these yet.</p>
+        ${gaps.map(t => `<div class="li" data-topic="${t.id}"><span class="grow">${esc(t.name)}</span><small class="muted">${SUBJECT_MAP[t.subject].icon}</small></div>`).join("") || `<p class="empty">No gaps – great!</p>`}
+      </section>
+      ${T.expertsCard()}
+    </div>
+    <div>
+      ${T.pulseCard()}
+      <section class="card">
+        <h2>📰 Recent activity</h2>
+        ${S.activity.slice(0, 20).map(a => `<div class="li">${avatar(a.uid, 22)}<span class="grow"><b>${esc(nameOf(a.uid))}</b> ${esc(a.text)}</span><small class="muted">${ago(a.createdAt)}</small></div>`).join("") || `<p class="empty">No activity yet.</p>`}
+      </section>
+    </div>
   </div>`;
-}
-
-function statusSelect(tid) {
-  const cur = statusOf(S.me.uid, tid);
-  return `<select class="status ${STATUS[cur].cls}" data-status="${tid}">
-    ${Object.entries(STATUS).map(([k, v]) => `<option value="${k}" ${cur === k ? "selected" : ""}>${v.label}</option>`).join("")}</select>`;
 }
 
 function viewSyllabus() {
@@ -337,11 +333,10 @@ function viewSyllabus() {
       ${topics.map(t => {
         const res = S.resources.filter(r => r.topicId === t.id);
         const vids = res.filter(r => r.type === "youtube").length, notes = res.length - vids;
-        const cm = S.comments.filter(c => c.topicId === t.id).length;
-        const nq = T.X.scope({ topic: t.id }).length;
+        const cm = S.comments.filter(c => c.topicId === t.id).length, nq = T.X.scope({ topic: t.id }).length, nv = S.vault.filter(v => v.topicId === t.id).length;
         return `<div class="topic">
           <button class="tname" data-topic="${t.id}">${esc(t.name)}</button>
-          <div class="counts">${nq ? `<span title="PYQ questions in bank">❓ ${nq}</span>` : ""}${vids ? `<span title="Videos">▶️ ${vids}</span>` : ""}${notes ? `<span title="Notes/links">📄 ${notes}</span>` : ""}${cm ? `<span title="Comments">💬 ${cm}</span>` : ""}</div>
+          <div class="counts">${nq ? `<span title="PYQ questions in bank">❓ ${nq}</span>` : ""}${vids ? `<span title="Videos">▶️ ${vids}</span>` : ""}${notes ? `<span title="Notes/links">📄 ${notes}</span>` : ""}${nv ? `<span title="Formulas & tricks">📐 ${nv}</span>` : ""}${cm ? `<span title="Comments">💬 ${cm}</span>` : ""}</div>
           <div class="friends">${us.filter(u => u.id !== S.me.uid).map(u => `<i class="dot ${STATUS[statusOf(u.id, t.id)].cls}" style="outline-color:${color(u.id)}" title="${esc(nameOf(u.id))}: ${STATUS[statusOf(u.id, t.id)].label}"></i>`).join("")}</div>
           ${statusSelect(t.id)}
         </div>`;
@@ -355,9 +350,9 @@ function viewLibrary() {
   const list = S.resources.filter(r =>
     (S.libType === "all" || r.type === S.libType) &&
     (S.libSubject === "all" || TOPIC_MAP[r.topicId]?.subject === S.libSubject) &&
-    `${r.title} ${TOPIC_MAP[r.topicId]?.name || ""}`.toLowerCase().includes(q));
+    `${r.title} ${TOPIC_MAP[r.topicId]?.name || ""}`.toLowerCase().includes(q)).sort((a, b) => T.X.votesOf(b.id) - T.X.votesOf(a.id) || (b.createdAt || 0) - (a.createdAt || 0));
   return `
-  <header class="page-head"><div><h1>Library</h1><p class="muted">Every video, note and practice link shared by the group.</p></div>
+  <header class="page-head"><div><h1>Library</h1><p class="muted">Every video, note and practice link shared by the group – the most helpful ones (👍) come first.</p></div>
     <button class="btn primary" data-act="addRes">+ Add resource</button></header>
   <div class="card">
     <div class="toolbar">
@@ -381,6 +376,7 @@ function resCard(r) {
       ${t ? `<button class="link small" data-topic="${t.id}">${SUBJECT_MAP[t.subject].icon} ${esc(t.name)}</button>` : ""}
       <div class="row small muted">${avatar(r.uid, 18)} ${esc(nameOf(r.uid))} · ${ago(r.createdAt)}</div>
       <div class="row">
+        ${T.voteBtn(r.id)}
         ${r.type === "drive" && drivePreview(r.url) ? `<button class="btn sm" data-preview="${esc(drivePreview(r.url))}" data-title="${esc(r.title)}">Preview</button>` : ""}
         <a class="btn sm" href="${esc(r.url)}" target="_blank" rel="noopener">Open ↗</a>
         ${canDel ? `<button class="btn sm ghost danger" data-del="resources:${r.id}">Delete</button>` : ""}
@@ -390,7 +386,7 @@ function resCard(r) {
 
 const hoursOn = (uid, d) => S.logs.filter(l => l.uid === uid && l.date === d).reduce((a, l) => a + Number(l.hours || 0), 0);
 function viewTracker() {
-  const us = users();
+  const us = users(), hu = T.X.st.heatUser || S.me.uid;
   const myLogs = S.logs.filter(l => l.uid === S.me.uid).slice(0, 20);
   const last14 = [...Array(14)].map((_, i) => new Date(Date.now() - (13 - i) * DAY).toISOString().slice(0, 10));
   const maxH = Math.max(4, ...us.flatMap(u => last14.map(d => hoursOn(u.id, d))));
@@ -398,10 +394,12 @@ function viewTracker() {
   <header class="page-head"><div><h1>Study log &amp; mock tests</h1><p class="muted">Consistency beats intensity. Log every day.</p></div>
     <div class="row"><button class="btn primary" data-act="addLog">+ Log study</button><button class="btn" data-act="addMock">+ Add mock score</button></div></header>
 
+  <section class="card"><div class="row"><h2 class="grow">🔥 Study heat-map</h2>${us.map(u => `<button class="tab ${u.id === hu ? "on" : ""}" data-t="heatUser:${u.id}">${esc(u.name.split(" ")[0])}</button>`).join("")}</div>${T.heatmap(hu)}</section>
+
   <section class="card"><h2>Last 14 days (hours)</h2>
     ${us.map(u => `<div class="spark-row">${avatar(u.id, 24)}<div class="spark">${last14.map(d => {
       const h = hoursOn(u.id, d);
-      return `<i title="${d}: ${h}h" style="height:${Math.max(3, (h / maxH) * 48)}px;background:${h ? color(u.id) : "#e5e7eb"}"></i>`;
+      return `<i title="${d}: ${Math.round(h * 10) / 10}h" style="height:${Math.max(3, (h / maxH) * 48)}px;background:${h ? color(u.id) : "#e5e7eb"}"></i>`;
     }).join("")}</div><small>${weekHours(u.id)}h/wk</small></div>`).join("")}
   </section>
 
@@ -448,10 +446,10 @@ function viewDrives() {
 
 function viewAdmin() {
   const open = S.reports.filter(r => r.status !== "done").length;
-  const tabs = [["members", "👥 Members"], ["qbank", "📚 Question bank"], ["tests", "🧪 Tests"], ["reports", `🚩 Reports${open ? ` (${open})` : ""}`]];
-  const body = S.adminTab === "qbank" ? T.viewQBank() : S.adminTab === "tests" ? T.viewAdminTests() : S.adminTab === "reports" ? T.viewReports() : viewAdminMembers();
+  const tabs = [["members", "👥 Members"], ["qbank", "📚 Question bank"], ["papers", "🗃 Papers"], ["tests", "🧪 Tests"], ["reports", `🚩 Reports${open ? ` (${open})` : ""}`], ["targets", "🎯 Weekly targets"], ["backup", "💾 Backup"]];
+  const body = S.adminTab === "members" || !T.admin[S.adminTab] ? viewAdminMembers() : T.admin[S.adminTab]();
   return `
-  <header class="page-head"><div><h1>🛡️ Admin panel</h1><p class="muted">Manage members, the PYQ question bank, tests and reports.</p></div></header>
+  <header class="page-head"><div><h1>🛡️ Admin panel</h1><p class="muted">Manage members, the PYQ question bank, papers, tests, reports and backups.</p></div></header>
   <div class="tabs">${tabs.map(([k, l]) => `<button class="tab ${S.adminTab === k ? "on" : ""}" data-admintab="${k}">${l}</button>`).join("")}</div>
   ${body}`;
 }
@@ -541,16 +539,18 @@ function openTopic(tid) {
 }
 function renderDrawerBody() {
   const tid = S.openTopic, el = $("#drawerBody"); if (!el) return;
-  const res = S.resources.filter(r => r.topicId === tid);
+  const byVotes = (a, b) => T.X.votesOf(b.id) - T.X.votesOf(a.id) || (b.createdAt || 0) - (a.createdAt || 0);
+  const res = S.resources.filter(r => r.topicId === tid).sort(byVotes);
   const vids = res.filter(r => r.type === "youtube"), others = res.filter(r => r.type !== "youtube");
-  const cms = S.comments.filter(c => c.topicId === tid).slice().reverse();
+  const cms = S.comments.filter(c => c.topicId === tid).slice().sort((a, b) => T.X.votesOf(b.id) - T.X.votesOf(a.id) || (a.createdAt || 0) - (b.createdAt || 0));
   el.innerHTML = `
     <div class="who">${users().map(u => `<span class="pill ${STATUS[statusOf(u.id, tid)].cls}">${avatar(u.id, 18)} ${esc(nameOf(u.id))}: ${STATUS[statusOf(u.id, tid)].label}</span>`).join("")}</div>
     <div class="row mt-s"><b>My status:</b> ${statusSelect(tid)}</div>
     <h3>▶️ Videos (${vids.length})</h3><div class="res-grid">${vids.map(resCard).join("") || `<p class="empty">No videos yet.</p>`}</div>
     <h3>📄 Notes, PYQs &amp; links (${others.length})</h3><div class="res-grid">${others.map(resCard).join("") || `<p class="empty">Nothing yet.</p>`}</div>
-    <h3>💬 Discussion (${cms.length})</h3>
-    ${cms.map(c => `<div class="comment">${avatar(c.uid, 24)}<div class="grow"><b>${esc(nameOf(c.uid))}</b> <small class="muted">${ago(c.createdAt)}</small><p>${esc(c.text)}</p></div>${c.uid === S.me.uid || S.me.isAdmin ? `<button class="x" data-del="comments:${c.id}">✕</button>` : ""}</div>`).join("") || `<p class="empty">No messages yet.</p>`}`;
+    ${T.vaultForTopic(tid)}
+    <h3>💬 Doubts &amp; discussion (${cms.length}) <small class="muted">most helpful first</small></h3>
+    ${cms.map(c => `<div class="comment">${avatar(c.uid, 24)}<div class="grow"><b>${esc(nameOf(c.uid))}</b> <small class="muted">${ago(c.createdAt)}</small><p>${esc(c.text)}</p></div>${T.voteBtn(c.id)}${c.uid === S.me.uid || S.me.isAdmin ? `<button class="x" data-del="comments:${c.id}">✕</button>` : ""}</div>`).join("") || `<p class="empty">No messages yet.</p>`}`;
   wire(el);
 }
 
