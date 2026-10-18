@@ -1,5 +1,5 @@
 // ================== EDIT THIS FILE ONLY ==================
-// (Your real Firebase config lives in YOUR copy of this file – do not overwrite it with this one.)
+// (Keep YOUR real Firebase keys here – never overwrite this file with the one from a zip.)
 export const firebaseConfig = {
   apiKey: "PASTE_YOUR_API_KEY",
   authDomain: "your-project.firebaseapp.com",

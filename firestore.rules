@@ -9,76 +9,47 @@ service cloud.firestore {
     function isAdmin()  { return request.auth != null && myEmail() == adminEmail(); }
     function memberDoc() { return /databases/$(database)/documents/members/$(myEmail()); }
     // Only people the admin added (and not disabled) can use the site
-    function isMember() {
-      return request.auth != null && (isAdmin() ||
-        (exists(memberDoc()) && get(memberDoc()).data.active == true));
-    }
+    function isMember() { return request.auth != null && (isAdmin() || (exists(memberDoc()) && get(memberDoc()).data.active == true)); }
     function owner()    { return resource.data.uid == request.auth.uid; }
     function newOwner() { return request.resource.data.uid == request.auth.uid; }
 
-    // ---------- members / progress / notices ----------
+    // Members list (doc id = email). Only the admin adds / disables people. A member may only touch lastSeen / uid / the first-login flag.
     match /members/{email} {
       allow read: if isMember() || (request.auth != null && myEmail() == email);
       allow create, delete: if isAdmin();
-      allow update: if isAdmin() || (
-        isMember() && myEmail() == email
-        && request.resource.data.diff(resource.data).affectedKeys()
-             .hasOnly(['lastSeen', 'uid', 'mustChangePassword', 'pwChangedAt'])
+      allow update: if isAdmin() || (isMember() && myEmail() == email
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['lastSeen', 'uid', 'mustChangePassword'])
         && request.resource.data.uid == request.auth.uid
-        && (!('mustChangePassword' in request.resource.data.diff(resource.data).affectedKeys())
-            || request.resource.data.mustChangePassword == false)
-      );
+        && (!('mustChangePassword' in request.resource.data.diff(resource.data).affectedKeys()) || request.resource.data.mustChangePassword == false));
     }
-    // progress also holds your topic statistics (tstats) and saved timer preset (prefs)
-    match /progress/{uid} {
-      allow read: if isMember();
-      allow write: if isMember() && request.auth.uid == uid;
-    }
-    match /notices/{id} { allow read: if isMember(); allow write: if isAdmin(); }
-    match /targets/{id} { allow read: if isMember(); allow write: if isAdmin(); }   // weekly targets
+    // Topic status: everyone reads, only the owner writes
+    match /progress/{uid} { allow read: if isMember(); allow write: if isMember() && request.auth.uid == uid; }
 
-    // ---------- question bank, papers & tests (admin writes) ----------
-    // Questions (text + options, NO answers)
-    match /questions/{id} { allow read: if isMember(); allow write: if isAdmin(); }
-    // Answer keys + explanations (+ version log): members can fetch ONE doc at a time, cannot list the collection
-    match /answerKeys/{id} { allow get: if isMember(); allow list, write: if isAdmin(); }
-    // Light-weight search index (ids, topic, difficulty, verified flag, duplicate fingerprints)
-    match /qindex/{id} { allow read: if isMember(); allow write: if isAdmin(); }
-    // Full year / date / shift papers and mock tests
-    match /papers/{id} { allow read: if isMember(); allow write: if isAdmin(); }
-    match /tests/{id}  { allow read: if isMember(); allow write: if isAdmin(); }
+    // Admin-managed content
+    match /notices/{id}   { allow read: if isMember(); allow write: if isAdmin(); }
+    match /questions/{id} { allow read: if isMember(); allow write: if isAdmin(); }                       // question text + options (no answers)
+    match /answerKeys/{id} { allow get: if isMember(); allow list, write: if isAdmin(); }                  // answers + explanations: one at a time, cannot be listed
+    match /qindex/{id}    { allow read: if isMember(); allow write: if isAdmin(); }                       // tiny per-subject index used to pick random questions
+    match /papers/{id}    { allow read: if isMember(); allow write: if isAdmin(); }
 
-    // ---------- a student's attempts: private to them (admin can read; admin may recalculate after an answer-key fix) ----------
+    // A student's own data (the admin may read; the admin may also fix scores after correcting an answer key)
     match /attempts/{id} {
       allow read: if isMember() && (owner() || isAdmin());
       allow create: if isMember() && newOwner() && request.resource.data.status == 'running';
       allow update: if isMember() && ((owner() && newOwner() && resource.data.status == 'running') || isAdmin());
       allow delete: if isMember() && (owner() || isAdmin());
     }
-    // Personal notebook: wrong-question list (with revision schedule), starred questions, private notes
     match /mistakes/{id}  { allow read: if isMember() && (owner() || isAdmin()); allow create: if isMember() && newOwner(); allow update, delete: if isMember() && owner(); }
     match /bookmarks/{id} { allow read: if isMember() && (owner() || isAdmin()); allow create: if isMember() && newOwner(); allow update, delete: if isMember() && owner(); }
-    match /qnotes/{id}    { allow read: if isMember() && (owner() || isAdmin()); allow create: if isMember() && newOwner(); allow update, delete: if isMember() && owner(); }
 
-    // "Report this question": members create, only admin reads / resolves.
-    match /reports/{id} { allow read, update, delete: if isAdmin(); allow create: if isMember() && newOwner(); }
-    // Flag doc (id = question id) holds a reported question back from random tests until the admin resolves it
-    match /flags/{id} { allow read: if isMember(); allow create: if isMember() && newOwner(); allow update, delete: if isAdmin(); }
+    // "Report this question": members create; everyone can see open reports (so reported questions are skipped in new tests); only the admin resolves them
+    match /reports/{id} { allow read: if isMember(); allow create: if isMember() && newOwner(); allow update, delete: if isAdmin(); }
 
-    // Public score summary per exam-mode attempt (for group pulse + improvement board). No answers inside.
-    match /scores/{id} { allow read: if isMember(); allow create: if isMember() && newOwner(); allow update, delete: if isAdmin(); }
-    // 👍 votes on resources / doubts / vault items (doc id = uid_targetId)
-    match /votes/{id} { allow read: if isMember(); allow create: if isMember() && newOwner(); allow delete: if isMember() && owner(); }
-
-    // ---------- shared collections: members read/add; creator edits/deletes; admin can moderate ----------
+    // Shared: members read / add; the creator edits or deletes; the admin can moderate
     match /{col}/{id} {
-      allow read: if isMember() && col in ['resources', 'drives', 'logs', 'mocks', 'comments', 'activity', 'vault', 'cavault'];
-      allow create: if isMember()
-        && col in ['resources', 'drives', 'logs', 'mocks', 'comments', 'activity', 'vault', 'cavault']
-        && request.resource.data.uid == request.auth.uid;
-      allow update, delete: if isMember()
-        && col in ['resources', 'drives', 'logs', 'mocks', 'comments', 'activity', 'vault', 'cavault']
-        && (resource.data.uid == request.auth.uid || isAdmin());
+      allow read: if isMember() && col in ['resources', 'drives', 'logs'];
+      allow create: if isMember() && col in ['resources', 'drives', 'logs'] && request.resource.data.uid == request.auth.uid;
+      allow update, delete: if isMember() && col in ['resources', 'drives', 'logs'] && (resource.data.uid == request.auth.uid || isAdmin());
     }
   }
 }
